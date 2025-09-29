@@ -9,11 +9,14 @@ from __future__ import annotations
 import math
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
+import time
 
 # 全局函数导入已移除，现在使用客户端方法
 from logger import setup_logger
 from strategies.market_maker import MarketMaker, format_balance
+from strategies.components.order_ops import build_limit_order as _cmp_build_limit_order
 from utils.helpers import round_to_precision, round_to_tick_size
+from strategies.taker_executor import TakerExecutor, TakerConfig, OrderAttempt
 
 logger = setup_logger("perp_market_maker")
 
@@ -34,6 +37,13 @@ class PerpetualMarketMaker(MarketMaker):
         ws_proxy: Optional[str] = None,
         exchange: str = 'backpack',
         exchange_config: Optional[Dict[str, Any]] = None,
+        # taker 相关
+        mode: str = 'maker',
+        taker_slippage_bps: float = 3.0,
+        taker_ioc_ttl_ms: int = 150,
+        slice_count: int = 1,
+        cooldown: float = 0.5,
+        cost_cap_bps: float = 2.0,
         **kwargs,
     ) -> None:
         """
@@ -68,6 +78,17 @@ class PerpetualMarketMaker(MarketMaker):
         self.inventory_skew = max(0.0, min(1.0, inventory_skew))
         self.leverage = max(1.0, leverage)
 
+        # taker 配置（简化：滑点沿用 spread，切片沿用 max_orders）
+        self.mode = mode or 'maker'
+        # 将 percent(例如0.03%) 转换为 bps(3.0)
+        inferred_slippage_bps = float(self.base_spread_percentage) * 100.0
+        self.taker_slippage_bps = float(taker_slippage_bps) if mode != 'taker' else inferred_slippage_bps
+        # 切片数量沿用 max_orders
+        inferred_slice = self.max_orders if hasattr(self, 'max_orders') else 1
+        self.slice_count = int(slice_count) if mode != 'taker' else int(max(1, inferred_slice))
+
+        self._last_taker_side: str = 'Ask'  # 用于交替
+
         self.position_state: Dict[str, Any] = {
             "net": 0.0,
             "avg_entry": 0.0,
@@ -78,6 +99,11 @@ class PerpetualMarketMaker(MarketMaker):
         # 添加总成交量统计（以报价资产计价）
         self.total_volume_quote = 0.0
         self.session_total_volume_quote = 0.0
+        # taker 监控
+        self._taker_baseline: Dict[str, Dict[str, Any]] = {}
+        self.taker_slippage_bps_sum = 0.0
+        self.taker_fill_events = 0
+        self.taker_fee_sum = 0.0
 
         logger.info(
             "初始化永续合约做市: %s | 目标持仓量: %s | 最大持仓量: %s | 触发阈值: %s",
@@ -87,6 +113,18 @@ class PerpetualMarketMaker(MarketMaker):
             format_balance(self.position_threshold),
         )
         self._update_position_state()
+
+        # 构建 taker 执行器
+        self.taker_executor = TakerExecutor(
+            self.client,
+            TakerConfig(
+                symbol=self.symbol,
+                base_precision=self.base_precision,
+                tick_size=self.tick_size,
+                slippage_bps=self.taker_slippage_bps,
+                slice_count=self.slice_count,
+            ),
+        )
 
     def on_ws_message(self, stream, data):
         """处理WebSocket消息回调 - 添加总成交量统计"""
@@ -101,6 +139,9 @@ class PerpetualMarketMaker(MarketMaker):
                 try:
                     quantity = float(data.get('l', '0'))  # 成交数量
                     price = float(data.get('L', '0'))     # 成交价格
+                    order_id = str(data.get('i', '') or '')
+                    maker = bool(data.get('m', False))
+                    side = data.get('S')
                     
                     # 计算成交额（以报价资产计价）
                     trade_volume = quantity * price
@@ -108,6 +149,18 @@ class PerpetualMarketMaker(MarketMaker):
                     # 更新总成交量统计
                     self.total_volume_quote += trade_volume
                     self.session_total_volume_quote += trade_volume
+                    # 统计taker滑点与费用
+                    if not maker and order_id in self._taker_baseline:
+                        base = float(self._taker_baseline[order_id]['baseline'])
+                        if base > 0:
+                            if (side == 'Bid'):
+                                slippage_bps = (price - base) / base * 10000.0
+                            else:
+                                slippage_bps = (base - price) / base * 10000.0
+                            self.taker_slippage_bps_sum += slippage_bps
+                            self.taker_fill_events += 1
+                        fee = float(data.get('n', '0') or 0)
+                        self.taker_fee_sum += fee
                     
                     logger.debug(f"更新总成交量: +{trade_volume:.2f} {self.quote_asset}, 累计: {self.total_volume_quote:.2f}")
                     
@@ -326,6 +379,9 @@ class PerpetualMarketMaker(MarketMaker):
         logger.info(f"\n---永续合约总成交量统计---")
         logger.info(f"累计总成交量: {self.total_volume_quote:.2f} {self.quote_asset}")
         logger.info(f"本次执行总成交量: {self.session_total_volume_quote:.2f} {self.quote_asset}")
+        if self.taker_fill_events > 0:
+            logger.info(f"taker 平均滑点: {(self.taker_slippage_bps_sum / self.taker_fill_events):.3f} bps | taker 成交数: {self.taker_fill_events}")
+            logger.info(f"taker 手续费累计(报价资产): {self.taker_fee_sum:.6f}")
 
     def run(self, duration_seconds=3600, interval_seconds=60):
         """执行永续合约做市策略"""
@@ -333,9 +389,105 @@ class PerpetualMarketMaker(MarketMaker):
         
         # 重置本次执行的总成交量统计
         self.session_total_volume_quote = 0.0
-        
-        # 调用父类的 run 方法
-        super().run(duration_seconds, interval_seconds)
+        if (self.mode or 'maker') == 'taker':
+            # 复用父类循环，但通过覆写下单函数来走 taker 路径
+            super().run(duration_seconds, interval_seconds)
+        else:
+            super().run(duration_seconds, interval_seconds)
+
+    # 覆盖下单函数：当 mode==taker 时走 IOC 流程
+    def place_limit_orders(self):  # type: ignore[override]
+        if (self.mode or 'maker') != 'taker':
+            return super().place_limit_orders()
+        return self.place_taker_orders()
+
+    # ------------------------- Taker 核心 -------------------------
+    def _choose_taker_side(self) -> str:
+        net = self.get_net_position()
+        if abs(net) > self.position_threshold:
+            # 优先朝向减小敞口的方向
+            return 'Ask' if net > 0 else 'Bid'
+        # 交替方向，制造对称成交
+        self._last_taker_side = 'Bid' if self._last_taker_side == 'Ask' else 'Ask'
+        return self._last_taker_side
+
+    def place_taker_orders(self) -> None:
+        try:
+            # 清理可能存在的挂单，避免影响撮合（保留对冲RO单）
+            self.cancel_orders_diff()
+            if not self.order_quantity:
+                logger.error("taker 模式需要显式指定 --quantity")
+                return
+            side = self._choose_taker_side()
+            qty_total = max(self.min_order_size, round_to_precision(self.order_quantity, self.base_precision))
+            logger.info(f"[taker] 方向={side} 数量={format_balance(qty_total)} 切片={self.slice_count} 滑点={self.taker_slippage_bps}bp")
+
+            attempts = self.taker_executor.run_sliced(side, qty_total)
+            success = 0
+            for idx, attempt in enumerate(attempts, 1):
+                logger.info(
+                    "[taker] 切片 %s/%s 状态=%s 数量=%s 价格=%s 延迟=%.2fms 错误=%s",
+                    idx,
+                    len(attempts),
+                    attempt.status,
+                    format_balance(attempt.quantity),
+                    format_balance(attempt.price),
+                    attempt.latency_ms,
+                    attempt.error or "-",
+                )
+                if attempt.status != "accepted":
+                    continue
+                success += 1
+                if not attempt.order_id:
+                    continue
+                base = attempt.best_ask if side == 'Bid' else attempt.best_bid
+                if base:
+                    self._taker_baseline[attempt.order_id] = {"baseline": float(base), "side": side}
+            logger.info("[taker] 切片统计: 成功=%s 失败=%s", success, len(attempts) - success)
+
+            # 成交后检查是否需要减仓
+            if self.need_rebalance():
+                # 先尝试使用 ReduceOnly IOC 对冲，失败再走通用平仓
+                self.hedge_position()
+                self.rebalance_position()
+        except Exception as e:
+            logger.error(f"taker 下单流程异常: {e}")
+
+    def hedge_position(self) -> None:
+        """备用的快速对冲：使用 ReduceOnly IOC 将净仓拉回阈值以内。"""
+        try:
+            net, _, _ = self._get_position_snapshot()
+            excess = abs(net) - self.position_threshold
+            if excess <= 0:
+                return
+            best_orderbook = self.client.get_order_book(self.symbol)
+            bids = best_orderbook.get('bids', []) if isinstance(best_orderbook, dict) else []
+            asks = best_orderbook.get('asks', []) if isinstance(best_orderbook, dict) else []
+            best_bid = float(bids[-1][0]) if bids else None
+            best_ask = float(asks[0][0]) if asks else None
+            s = self.taker_slippage_bps / 10000.0
+            if net > 0:  # 需要卖出减少多头
+                price = round_to_tick_size((best_bid or 0) * (1 - s), self.tick_size)
+                side = 'Ask'
+            else:
+                price = round_to_tick_size((best_ask or 0) * (1 + s), self.tick_size)
+                side = 'Bid'
+            qty = round_to_precision(excess, self.base_precision)
+            order = _cmp_build_limit_order(
+                self.symbol,
+                side,
+                price,
+                qty,
+                time_in_force="IOC",
+                reduce_only=True,
+            )
+            res = self.client.execute_order(order)
+            if isinstance(res, dict) and "error" in res:
+                logger.warning(f"对冲失败: {res.get('error')}")
+            else:
+                logger.info(f"对冲提交: {side} {format_balance(qty)} @ {price}")
+        except Exception as e:
+            logger.error(f"对冲异常: {e}")
 
     # ------------------------------------------------------------------
     # 下单相关 (此处函数未变动)
@@ -365,21 +517,26 @@ class PerpetualMarketMaker(MarketMaker):
             )
             return {"error": "quantity_too_small"}
 
-        order_details: Dict[str, object] = {
-            "orderType": normalized_order_type,
-            "quantity": str(qty),
-            "side": side,
-            "symbol": self.symbol,
-            "reduceOnly": reduce_only,
-        }
-
         if normalized_order_type == "Limit":
             if price is None:
                 raise ValueError("Limit 订单需要提供价格")
             price_value = round_to_tick_size(price, self.tick_size)
-            order_details["price"] = str(price_value)
-            order_details["timeInForce"] = time_in_force.upper()
+            order_details = _cmp_build_limit_order(
+                self.symbol,
+                side,
+                price_value,
+                qty,
+                time_in_force=time_in_force,
+                reduce_only=reduce_only,
+            )
         else:
+            order_details = {
+                "orderType": normalized_order_type,
+                "quantity": str(qty),
+                "side": side,
+                "symbol": self.symbol,
+                "reduceOnly": reduce_only,
+            }
             # 使用当前深度推估价格方便记录
             bid_price, ask_price = self.get_market_depth()
             reference_price = ask_price if side == "Bid" else bid_price

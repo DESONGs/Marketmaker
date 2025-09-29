@@ -20,7 +20,7 @@ def parse_arguments():
     parser.add_argument('--cli', action='store_true', help='启动命令行界面')
     
     # 基本参数
-    parser.add_argument('--exchange', type=str, choices=['backpack', 'websea', 'aster'], default='backpack', help='交易所選擇 (backpack, websea 或 aster)')
+    parser.add_argument('--exchange', type=str, choices=['backpack', 'websea', 'aster', 'apex'], default='backpack', help='交易所選擇 (backpack, websea, aster 或 apex)')
     parser.add_argument('--api-key', type=str, help='API Key (可选，默认使用环境变数或配置文件)')
     parser.add_argument('--secret-key', type=str, help='Secret Key (可选，默认使用环境变数或配置文件)')
     parser.add_argument('--ws-proxy', type=str, help='WebSocket Proxy (可选，默认使用环境变数或配置文件)')
@@ -37,6 +37,9 @@ def parse_arguments():
     parser.add_argument('--max-position', type=float, default=1.0, help='永续合约最大允许仓位(绝对值)')
     parser.add_argument('--position-threshold', type=float, default=0.1, help='永续仓位调整触发值')
     parser.add_argument('--inventory-skew', type=float, default=0.0, help='永续仓位偏移调整系数 (0-1)')
+
+    # Taker 模式开关（仅 perp 使用）。其余参数复用现有 --spread 与 --max-orders
+    parser.add_argument('--mode', choices=['maker', 'taker'], default='maker', help='下单模式: maker 或 taker')
     
     # 重平设置参数
     parser.add_argument('--enable-rebalance', action='store_true', help='开启重平功能')
@@ -102,13 +105,22 @@ def main():
             'api_key': api_key,
             'secret_key': secret_key,
         }
+    elif exchange == 'apex':
+        # Apex使用配置文件，不需要环境变量
+        api_key = "apex_configured"  # 占位符
+        secret_key = "apex_configured"  # 占位符
+        ws_proxy = None
+        exchange_config = {
+            'account_label': args.api_key if args.api_key else None,  # 可以用api_key参数指定账户标签
+            'account_index': 0 if not args.api_key else None
+        }
     else:
-        logger.error("不支持的交易所，請選擇 'backpack', 'websea' 或 'aster'")
+        logger.error("不支持的交易所，請選擇 'backpack', 'websea', 'aster' 或 'apex'")
         sys.exit(1)
 
     
-    # 检查API密钥
-    if not api_key or not secret_key:
+    # 检查API密钥（apex除外，它使用配置文件）
+    if exchange != 'apex' and (not api_key or not secret_key):
         logger.error("缺少API密钥，请通过命令行参数或环境变量提供")
         sys.exit(1)
     
@@ -147,21 +159,45 @@ def main():
                 logger.info(f"  仓位触发值: {args.position_threshold}")
                 logger.info(f"  报价偏移系数: {args.inventory_skew}")
 
-                market_maker = PerpetualMarketMaker(
-                    api_key=api_key,
-                    secret_key=secret_key,
-                    symbol=args.symbol,
-                    base_spread_percentage=args.spread,
-                    order_quantity=args.quantity,
-                    max_orders=args.max_orders,
-                    target_position=args.target_position,
-                    max_position=args.max_position,
-                    position_threshold=args.position_threshold,
-                    inventory_skew=args.inventory_skew,
-                    ws_proxy=ws_proxy,
-                    exchange=exchange,
-                    exchange_config=exchange_config
-                )
+                if args.mode == 'taker' and args.quantity is None:
+                    logger.error("taker 模式需要明确指定 --quantity")
+                    sys.exit(1)
+
+                # 对于Apex交易所，使用特殊的初始化方式
+                if exchange == 'apex':
+                    market_maker = PerpetualMarketMaker(
+                        api_key=api_key,  # 占位符
+                        secret_key=secret_key,  # 占位符
+                        symbol=args.symbol,
+                        base_spread_percentage=args.spread,
+                        order_quantity=args.quantity,
+                        max_orders=args.max_orders,
+                        target_position=args.target_position,
+                        max_position=args.max_position,
+                        position_threshold=args.position_threshold,
+                        inventory_skew=args.inventory_skew,
+                        ws_proxy=ws_proxy,
+                        exchange=exchange,
+                        exchange_config=exchange_config,
+                        mode=args.mode
+                    )
+                else:
+                    market_maker = PerpetualMarketMaker(
+                        api_key=api_key,
+                        secret_key=secret_key,
+                        symbol=args.symbol,
+                        base_spread_percentage=args.spread,
+                        order_quantity=args.quantity,
+                        max_orders=args.max_orders,
+                        target_position=args.target_position,
+                        max_position=args.max_position,
+                        position_threshold=args.position_threshold,
+                        inventory_skew=args.inventory_skew,
+                        ws_proxy=ws_proxy,
+                        exchange=exchange,
+                        exchange_config=exchange_config,
+                        mode=args.mode
+                    )
             else:
                 logger.info("启动现货做市模式")
                 enable_rebalance = True  # 默认开启
